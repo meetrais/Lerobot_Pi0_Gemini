@@ -1,7 +1,6 @@
 import os
 import re
 import cv2
-import matplotlib.pyplot as plt
 import time
 import numpy as np
 import torch
@@ -54,11 +53,7 @@ def parse_json(json_string):
             json_string = match.group(1)
         return json.loads(json_string)
     except json.JSONDecodeError as e:
-        print(f"JSONDecodeError: {e}")
-        print(f"Raw JSON string: {json_string}")
-        return None
-    except Exception as e:
-        print(f"An unexpected error occurred during JSON parsing: {e}")
+        print(f"Error parsing JSON: {e}")
         print(f"Raw JSON string: {json_string}")
         return None
 
@@ -77,18 +72,12 @@ def get_2D_bbox(image, prompt, model):
         prompt
     ]
     response = model.generate_content(contents)
-    response_text = response.text
-    if not isinstance(response_text, str):
-        print(f"Gemini response is not a string: {type(response_text)}")
-        return None
-    return response_text
+    return response.text
 
 def get_target_bbox(image_tensor, prompt, gemini_model):
     """
     Identifies pick and place targets from an image using Gemini,
     based on a user prompt.
-    Returns: detected_objects (raw parsed JSON), pick_boxes, place_boxes,
-             norm_pick_boxes, norm_place_boxes, pick_labels, place_labels
     """
     image_pil = tensor_to_pil(image_tensor)
     width, height = image_pil.size
@@ -98,7 +87,7 @@ def get_target_bbox(image_tensor, prompt, gemini_model):
 
     if not detected_objects:
         print("No objects detected by Gemini or JSON parsing failed.")
-        return [], [], [], [], [], [], [] # Added empty list for detected_objects
+        return [], [], [], [], [], []
 
     pick_boxes = []
     place_boxes = []
@@ -115,9 +104,10 @@ def get_target_bbox(image_tensor, prompt, gemini_model):
         print(f"Extracted user_task: {user_task}")
 
     # Simple heuristic for identifying place targets based on keywords in label
-    place_keywords_in_label = ["bin", "box", "container", "tray", "area", "table"] # Added "area", "table"
+    place_keywords_in_label = ["bin", "box", "container", "tray"]
 
     # Attempt to identify a specific place object mentioned in the user_task
+    # e.g., "put it in the blue bin" -> "blue bin"
     target_place_label_from_task = None
     place_match_in_task = re.search(r"(?:in|to) the (.*?)(?:\s|$)", user_task, re.IGNORECASE)
     if place_match_in_task:
@@ -151,18 +141,36 @@ def get_target_bbox(image_tensor, prompt, gemini_model):
             norm_pick_boxes.append(norm_bbox_tensor)
             pick_labels.append(obj["label"])
 
-    return detected_objects, pick_boxes, place_boxes, norm_pick_boxes, norm_place_boxes, pick_labels, place_labels
+    return pick_boxes, place_boxes, norm_pick_boxes, norm_place_boxes, pick_labels, place_labels
 
-# Removed get_random_targets as it's replaced by specific selection logic
+def get_random_targets(pick_boxes, place_boxes, norm_pick_boxes, norm_place_boxes, pick_labels, place_labels):
+    """
+    Selects a random pick and place target from the identified lists.
+    Returns the selected single targets and the original lists.
+    """
+    if not pick_boxes:
+        print("No pick targets available.")
+        return None, None, None, None, [], [], None, None, []
+    if not place_boxes:
+        print("No place targets available. Cannot select a pick-and-place pair.")
+        return None, None, None, None, pick_boxes, norm_pick_boxes, None, None, pick_labels
 
-# --- End of reimplemented functions ---
+    pick_idx = random.randrange(len(pick_boxes))
+    pick_t = pick_boxes[pick_idx]["box_2d"]
+    norm_pick_t = norm_pick_boxes[pick_idx]
+    pick_target_label = pick_labels[pick_idx]
+
+    place_idx = random.randrange(len(place_boxes))
+    place_t = place_boxes[place_idx]["box_2d"]
+    norm_place_t = norm_place_boxes[place_idx]
+    place_target_label = place_labels[place_idx]
+
+    return pick_t, place_t, norm_pick_t, norm_place_t, pick_boxes, norm_pick_boxes, pick_target_label, place_target_label, pick_labels
 
 def setup_key_listener():
     events = {"exit_early": False, "rerecord_episode": False,
               "stop_recording": False, "select_new_bbox": False}
-
     from pynput import keyboard
-
     def on_press(key):
         try:
             if key == keyboard.Key.right:
@@ -173,314 +181,150 @@ def setup_key_listener():
                 events["select_new_bbox"] = True
         except Exception as e:
             print(f"Error handling key press: {e}")
-
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
-
     return listener, events
 
-def return_bbox(boxes, idx):
-    # Note: This function's normalization by 1000 is separate from the [0,1] normalization
-    # used for the policy, and is likely for a specific unit conversion (e.g., mm to meters).
-    pick_t = boxes[idx]['box_2d']
-    norm_pick_t = [p/1000 for p in pick_t]
-    return norm_pick_t, pick_t
-
-def select_bbox(boxes):
-    selection = int(input("Enter the number of the bounding box you want to select: "))
-
-    # Validate selection
-    if 0 <= selection < len(boxes):
-        return return_bbox(boxes,selection)
-    else:
-        print(f"Invalid selection. Please choose a number between 0 and {len(boxes)-1}")
-
-def iterate_over_bbox(boxes):
-    for i in range(len(boxes)):
-        norm_pick_t, pick_t = return_bbox(boxes,i)
-        yield norm_pick_t, pick_t
-
 # --- Main script execution starts here ---
-
-# Configure Gemini API
+load_dotenv(".env")
 try:
-    load_dotenv(".env") # Load environment variables from .env file
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 except KeyError:
-    print("GEMINI_API_KEY environment variable not set. Please set it before running.")
+    print("GEMINI_API_KEY environment variable not set.")
     exit()
 
-# Initialize Gemini Model
 gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
 
-# Create camera config using proper config objects
-# IMPORTANT: Changed "laptop" to "hand" to match PI0Policy's expected image features
 cameras = {
-    "hand": OpenCVCameraConfig( # Changed "laptop" to "hand"
-        camera_index=2,  # Built-in webcam (assuming this is your "hand" view)
-        fps=30,
-        width=640,
-        height=480
-    ),
-    "top": OpenCVCameraConfig(
-        camera_index=0,  # iPhone camera (assuming this is your "top" view)
-        fps=30,
-        width=640,
-        height=480
-    )
-    }
+    "primary": OpenCVCameraConfig(camera_index=2, fps=30, width=640, height=480),
+    "top": OpenCVCameraConfig(camera_index=0, fps=30, width=640, height=480)
+}
+robot_cfg = So100RobotConfig(cameras=cameras, mock=False)
 
-robot_cfg = So100RobotConfig(
-            cameras=cameras,
-            mock=False,
-        )
-
-# Determine device for PyTorch
-if torch.backends.mps.is_available():
-    device = "mps"
-elif torch.cuda.is_available():
-    device = "cuda"
-else:
-    device = "cpu"
+if torch.backends.mps.is_available(): device = "mps"
+elif torch.cuda.is_available(): device = "cuda"
+else: device = "cpu"
 print(f"Using device: {device}")
 
 inference_time_s = 100
 fps = 30
-# audio configs (commented out as per original, but kept for context)
-# SAMPLE_RATE = 16_000
-# DURATION = 7
+SAMPLE_RATE = 16_000
+DURATION = 7
+output_dir = "/Users/meetr/Downloads/robot/audio" # Specific path
+os.makedirs(output_dir, exist_ok=True)
 
-# Whisper configs (commented out as per original, but kept for context)
-# model_size = "medium"
-# whisper_device = "cuda" if torch.cuda.is_available() else "cpu"
-# model = WhisperModel(model_size, device=whisper_device, compute_type="int8")
+model_size = "medium"
+whisper_device = "cuda" if torch.cuda.is_available() else "cpu"
+whisper_model = WhisperModel(model_size, device=whisper_device, compute_type="int8")
 
-# Policy paths - now using Hugging Face Hub ID for PI0Policy
-act_path = "lerobot/act" # Example for ACT, if you were to use it
-pi0_path = "lerobot/pi0" # Changed to Hugging Face Hub ID
-pi0fast_path = "lerobot/pi0fast" # Example for PI0FAST, if you were to use it
-
+pi0_path = "lerobot/pi0"
 print("Loading Policy.")
-# Select policy
-#policy = ACTPolicy.from_pretrained(act_path)
-policy = PI0Policy.from_pretrained(pi0_path) # This will now download from Hugging Face Hub
-#policy = PI0FASTPolicy.from_pretrained(pi0fast_path)
+policy = PI0Policy.from_pretrained(pi0_path)
 policy.to(device)
 print("Policy loaded.")
 
-# --- Audio recording and transcription (commented out as per original) ---
-# user_task = "Add all wooden blocks to the blue bin" # Default hardcoded task
-"""
-try:
-    audio = sd.rec(int(DURATION * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype='int16')
-    sd.wait()  # wait until recording is finished
+user_task = "Pickup yellow lego and put into white box."
+# Audio recording section commented out as in user's provided code
+prompt = f"""User request: {user_task}
 
-    # Convert numpy array to MP3 using pydub
-    audio_segment = AudioSegment(
-        audio.tobytes(),
-        frame_rate=SAMPLE_RATE,
-        sample_width=audio.dtype.itemsize,
-        channels=1
-    )
+    Analyze the provided image and understand what the user needs. Identify all relevant objects on the desk that would help fulfill this request.
+    For example:
+    - If the user wants to build something (like a red lego wall or wooden tower or lego plane), find all appropriate building pieces (Focus on identifying all red lego bricks on the desk that could be used for building a wall. Or in case of wooden tower, identify all wooden blocks on the desk that could be used for building a tower or all lego pieces on the desk that could be used to build a plane.)
+    - If the user wants to clear the desk, identify all objects on the desk that need to be cleared
+    - If the user wants specific colored items, focus on those colors
+    - If the users mentions place location, identify the location of the object on the desk
+    - If user is pointing to an object, identify the object that the user is pointing to.
+    Ignore the robot arm itself if visible.
+    Return your findings strictly as a JSON array of bounding boxes.
+    Example format: [{{"label": "red lego brick", "box_2d": [100, 200, 150, 280]}}, {{"label": "blue bin", "box_2d": [500, 600, 700, 850]}}]"""
 
-    output_file = os.path.join(output_dir, "command1.mp3")
-    audio_segment.export(output_file, format="mp3")
-    print(" Saved audio to", output_file)
-
-    segments, info = model.transcribe(output_file)
-    print(f"Detected language: {info.language} — probability {info.language_probability:.2%}\n")
-
-    transcribed_task = " ".join(s.text.strip() for s in segments)
-    print("📝 Transcript:", transcribed_task)
-    user_task = transcribed_task # Use transcribed task if successful
-except Exception as e:
-    print(f"Error during audio recording or transcription: {e}")
-    print(f"Proceeding with hardcoded user_task: '{user_task}'")
-"""
-# Define the user's high-level task for the robot
-user_task_for_robot = "Pickup yellow lego."
-
-# Construct the prompt for Gemini to perform general object detection
-gemini_vision_prompt = f"""User request: {user_task_for_robot}
-
-You are a robot tasked with identifying objects in an image.
-Identify all distinct objects in the image and their 2D bounding boxes.
-For each object, provide a concise label and its bounding box coordinates [x1, y1, x2, y2].
-Return your findings strictly as a JSON array of objects.
-Example format: [{{ "label": "red block", "box_2d": [10, 20, 30, 40] }}, {{ "label": "blue bin", "box_2d": [50, 60, 70, 80] }}]
-"""
-
-# --- Perception: Get target bounding boxes using Gemini ---
-# Create and connect robot
-print("Create and connect robot")
 robot = make_robot_from_config(robot_cfg)
 print("Connecting main follower arm.")
 print("Connecting main leader arm.")
 robot.connect()
 print("Activating torque on main follower arm.")
 
-raw_observation = robot.capture_observation() # Renamed to avoid confusion
-# Call get_target_bbox with the comprehensive prompt
-# IMPORTANT: Changed "observation.images.laptop" to "observation.images.hand"
-detected_objects_raw, pick_all, place_all, norm_pick_all, norm_place_all, pick_labels_all, place_labels_all = \
-    get_target_bbox(raw_observation["observation.images.hand"], prompt=gemini_vision_prompt, gemini_model=gemini_model)
+observation_raw = robot.capture_observation()
+pick, place, norm_pick, norm_place, pick_labels, place_labels = get_target_bbox(observation_raw["observation.images.primary"], prompt=prompt, gemini_model=gemini_model)
 
-print("\n--- Gemini Detected Objects (Raw JSON) ---")
-if detected_objects_raw:
-    print(json.dumps(detected_objects_raw, indent=2))
-else:
-    print("No objects detected by Gemini.")
+print("Pick objects:")
+for lbl in pick_labels: print(lbl)
+print("Place location:")
+for i, lbl in enumerate(place_labels): print(lbl, place[i])
 
-print("\nPick objects detected by Gemini:")
-for i in range(len(pick_all)):
-    print(f"- {pick_labels_all[i]} (Box: {pick_all[i]['box_2d']})")
-print("\nPlace locations detected by Gemini:")
-for i in range(len(place_all)):
-    print(f"- {place_labels_all[i]} (Box: {place_all[i]['box_2d']})")
+pick_t, place_t, norm_pick_t, norm_place_t, _, _, pick_target_label, place_target_label, _ = \
+    get_random_targets(pick, place, norm_pick, norm_place, pick_labels, place_labels)
 
-# --- Specific target selection for "yellow lego" and a place ---
-target_pick_label_str = "yellow lego"
-selected_pick_t = None
-selected_norm_pick_t = None
-selected_pick_target_label = None
-
-# Find the specific pick target ("yellow lego")
-for i, label in enumerate(pick_labels_all):
-    if target_pick_label_str.lower() in label.lower():
-        selected_pick_t = pick_all[i]["box_2d"]
-        selected_norm_pick_t = norm_pick_all[i]
-        selected_pick_target_label = pick_labels_all[i]
-        break
-
-if selected_pick_t is None:
-    print(f"Could not find '{target_pick_label_str}' among detected objects. Exiting.")
-    robot.disconnect()
+if pick_t is None or place_t is None:
+    print("Could not determine valid pick and/or place targets. Exiting.")
+    if robot.is_connected: robot.disconnect()
     exit()
-
-# Determine the place target
-selected_place_t = None
-selected_norm_place_t = None
-selected_place_target_label = None
-
-# Strategy for place target:
-# 1. Look for a place target mentioned in the user_task_for_robot (e.g., "put in blue bin")
-# 2. If not specified, look for generic place keywords in detected objects ("bin", "box", "container", "tray", "area", "table")
-# 3. If still no place, use the first available place object detected by Gemini.
-
-# Extract potential place target from user_task_for_robot
-place_target_from_task = None
-place_match_in_task = re.search(r"(?:in|to) the (.*?)(?:\s|$)", user_task_for_robot, re.IGNORECASE)
-if place_match_in_task:
-    place_target_from_task = place_match_in_task.group(1).strip().lower()
-    print(f"Identified potential place target from task: '{place_target_from_task}'")
-
-if place_target_from_task:
-    for i, label in enumerate(place_labels_all):
-        if place_target_from_task in label.lower():
-            selected_place_t = place_all[i]["box_2d"]
-            selected_norm_place_t = norm_place_all[i]
-            selected_place_target_label = place_labels_all[i]
-            break
-
-# If no specific place target from task, try generic keywords
-if selected_place_t is None:
-    for i, label in enumerate(place_labels_all):
-        if any(keyword in label.lower() for keyword in ["bin", "box", "container", "tray", "area", "table"]):
-            selected_place_t = place_all[i]["box_2d"]
-            selected_norm_place_t = norm_place_all[i]
-            selected_place_target_label = place_labels_all[i]
-            break
-
-# If still no place target, take the first one if any exist
-if selected_place_t is None and place_all:
-    selected_place_t = place_all[0]["box_2d"]
-    selected_norm_place_t = norm_place_all[0]
-    selected_place_target_label = place_labels_all[0]
-
-if selected_place_t is None:
-    print("No suitable place target found. Exiting.")
-    robot.disconnect()
-    exit()
-
-# Assign the selected targets for the policy
-pick_t = selected_pick_t
-place_t = selected_place_t
-norm_pick_t = selected_norm_pick_t
-norm_place_t = selected_norm_place_t
-pick_target_label = selected_pick_target_label
-place_target_label = selected_place_target_label
 
 single_task = f"Grasp {pick_target_label} and put it in {place_target_label}"
-print(f"\nCurrent task: {single_task}")
+print(f"Current task: {single_task}")
 
 listener, events = setup_key_listener()
 
-# --- Main control loop ---
 for _ in range(inference_time_s * fps):
     start_time = time.perf_counter()
+    if events["exit_early"]: break
 
-    if events["exit_early"]:
-        print("Exiting early due to key press.")
-        break
+    observation = robot.capture_observation()
+    current_obs_state = observation["observation.state"]
+    # Ensure norm_pick_t and norm_place_t are 1D tensors before concatenation
+    norm_pick_t_flat = norm_pick_t.flatten()
+    norm_place_t_flat = norm_place_t.flatten()
+    
+    observation["observation.state"] = torch.cat([current_obs_state, norm_pick_t_flat, norm_place_t_flat])
+    observation["task"] = single_task # Ensure task is part of the observation for the policy
 
-    # Read the follower state and access the frames from the cameras
-    raw_observation = robot.capture_observation()
-
-    # Prepare a new dictionary for the policy input
-    policy_input_batch = {}
-
-    # Handle task
-    policy_input_batch["task"] = [single_task] # Wrap in list for batch dimension
-
-    # Handle state
-    current_state = raw_observation["observation.state"]
-    if not isinstance(current_state, torch.Tensor):
-        current_state = torch.tensor(current_state, dtype=torch.float32)
-
-    # Concatenate normalized pick and place targets to the observation state
-    combined_state = torch.cat([current_state, norm_pick_t, norm_place_t])
-    policy_input_batch["observation.state"] = combined_state.unsqueeze(0).to(device)
-
-    # Handle images: Iterate through the camera names defined in `cameras` config
-    for cam_name in cameras.keys():
-        image_key_in_observation = f"observation.images.{cam_name}"
-        if image_key_in_observation in raw_observation:
-            image_data = raw_observation[image_key_in_observation]
-            
-            # Ensure image_data is a PyTorch tensor
-            if not isinstance(image_data, torch.Tensor):
-                # If it's a NumPy array, convert it
-                image_tensor = torch.from_numpy(image_data)
+    batch_for_policy = {}
+    for name, value in observation.items():
+        if name == "task":
+            batch_for_policy[name] = [value] # Wrap in list
+            continue
+        if "image" in name:
+            processed_image = value.type(torch.float32) / 255
+            processed_image = processed_image.permute(2, 0, 1).contiguous()
+            batch_for_policy[name] = processed_image.unsqueeze(0).to(device)
+        elif name == "observation.state":
+             batch_for_policy[name] = value.unsqueeze(0).to(device)
+        else: # For any other keys that might be there from robot.capture_observation()
+            if torch.is_tensor(value):
+                batch_for_policy[name] = value.unsqueeze(0).to(device)
             else:
-                # If it's already a tensor, use it directly
-                image_tensor = image_data
+                batch_for_policy[name] = value
 
-            # Ensure the tensor is float32 and normalized to [0, 1]
-            image_tensor = image_tensor.type(torch.float32) / 255.0
 
-            # Permute to (C, H, W) if it's (H, W, C)
-            # Check current dimensions to avoid errors if already CHW
-            if image_tensor.ndim == 3 and image_tensor.shape[2] in [1, 3]: # Assuming C is last dim for HWC
-                image_tensor = image_tensor.permute(2, 0, 1).contiguous()
-            elif image_tensor.ndim == 3 and image_tensor.shape[0] in [1, 3]: # Already CHW
-                pass # Do nothing
+    # +++ START DEBUGGING PRINTS +++
+    print("\n--- DEBUG INFO ---")
+    print("Batch keys being passed to policy.select_action:", list(batch_for_policy.keys()))
+    print("Inspecting policy.config object:")
+    if hasattr(policy, 'config'):
+        config_obj = policy.config
+        print(f"  Type of policy.config: {type(config_obj)}")
+        
+        attributes_to_check = ['image_features', 'input_features', 'output_features', 
+                               'env_state_feature', 'robot_state_feature', 'modalities', 
+                               'n_obs_steps', 'n_action_steps']
+        for attr_name in attributes_to_check:
+            if hasattr(config_obj, attr_name):
+                print(f"  policy.config.{attr_name}: {getattr(config_obj, attr_name)}")
             else:
-                print(f"Warning: Unexpected image tensor shape for {image_key_in_observation}: {image_tensor.shape}. Expected (H, W, C) or (C, H, W).")
-                continue # Skip this image if shape is unexpected
+                print(f"  policy.config.{attr_name}: Not found")
+        
+        if not hasattr(config_obj, 'modalities') and hasattr(config_obj, '__dataclass_fields__'):
+            if 'modalities' in config_obj.__dataclass_fields__:
+                print("  'modalities' is a dataclass field, but not directly an attribute. Value might be missing or None.")
+            else:
+                print("  'modalities' is not among __dataclass_fields__.")
+    else:
+        print("  policy.config attribute does not exist.")
+    print("--- END DEBUG INFO ---\n")
+    # +++ END DEBUGGING PRINTS +++
 
-            # Add batch dimension and move to device
-            policy_input_batch[image_key_in_observation] = image_tensor.unsqueeze(0).to(device)
-        else:
-            print(f"Warning: Image key '{image_key_in_observation}' not found in raw_observation.")
-
-
-    # Compute the next action with the policy based on the current observation
-    action = policy.select_action(policy_input_batch)
-    # Remove batch dimension
-    action = action.squeeze(0)
-    # Move to cpu, if not already the case
-    action = action.to("cpu")
-    # Order the robot to move
+    action = policy.select_action(batch_for_policy)
+    action = action.squeeze(0).to("cpu")
     robot.send_action(action)
 
     dt_s = time.perf_counter() - start_time
@@ -489,60 +333,21 @@ for _ in range(inference_time_s * fps):
     if events["select_new_bbox"]:
         events["select_new_bbox"] = False
         print("Re-selecting new bounding box targets...")
-        # Capture a fresh observation for new perception
-        fresh_raw_observation = robot.capture_observation()
-        # IMPORTANT: Changed "observation.images.laptop" to "observation.images.hand"
-        detected_objects_raw, pick_all, place_all, norm_pick_all, norm_place_all, pick_labels_all, place_labels_all = \
-            get_target_bbox(fresh_raw_observation["observation.images.hand"], prompt=gemini_vision_prompt, gemini_model=gemini_model)
+        fresh_observation_raw = robot.capture_observation()
+        pick, place, norm_pick, norm_place, pick_labels, place_labels = get_target_bbox(
+            fresh_observation_raw["observation.images.primary"], prompt=prompt, gemini_model=gemini_model
+        )
+        pick_t_new, place_t_new, norm_pick_t_new, norm_place_t_new, _, _, pick_target_label_new, place_target_label_new, _ = \
+            get_random_targets(pick, place, norm_pick, norm_place, pick_labels, place_labels)
 
-        print("\n--- Gemini Detected Objects (Raw JSON) after re-selection ---")
-        if detected_objects_raw:
-            print(json.dumps(detected_objects_raw, indent=2))
-        else:
-            print("No objects detected by Gemini after re-selection.")
-
-        # Re-apply specific target selection logic
-        selected_pick_t_new = None
-        selected_norm_pick_t_new = None
-        selected_pick_target_label_new = None
-
-        for i, label in enumerate(pick_labels_all):
-            if target_pick_label_str.lower() in label.lower():
-                selected_pick_t_new = pick_all[i]["box_2d"]
-                selected_norm_pick_t_new = norm_pick_all[i]
-                selected_pick_target_label_new = pick_labels_all[i]
-                break
-
-        selected_place_t_new = None
-        selected_norm_place_t_new = None
-        selected_place_target_label_new = None
-
-        place_target_from_task_new = None
-        place_match_in_task_new = re.search(r"(?:in|to) the (.*?)(?:\s|$)", user_task_for_robot, re.IGNORECASE)
-        if place_match_in_task_new:
-            place_target_from_task_new = place_match_in_task_new.group(1).strip().lower()
-
-        if selected_place_t_new is None: # Check if a place was found from task, if not, try generic
-            for i, label in enumerate(place_labels_all):
-                if any(keyword in label.lower() for keyword in ["bin", "box", "container", "tray", "area", "table"]):
-                    selected_place_t_new = place_all[i]["box_2d"]
-                    selected_norm_place_t_new = norm_place_all[i]
-                    selected_place_target_label_new = place_labels_all[i]
-                    break
-        
-        if selected_place_t_new is None and place_all: # If still no place, take the first available
-            selected_place_t_new = place_all[0]["box_2d"]
-            selected_norm_place_t_new = norm_place_all[0]
-            selected_place_target_label_new = place_labels_all[0]
-
-        if selected_pick_t_new is None or selected_place_t_new is None:
-            print("Could not determine valid pick and/or place targets after re-selection. Continuing with previous task.")
-        else:
-            pick_t, place_t, norm_pick_t, norm_place_t = selected_pick_t_new, selected_place_t_new, selected_norm_pick_t_new, selected_norm_place_t_new
-            pick_target_label, place_target_label = selected_pick_target_label_new, selected_place_target_label_new
+        if pick_t_new is not None and place_t_new is not None:
+            pick_t, place_t, norm_pick_t, norm_place_t = pick_t_new, place_t_new, norm_pick_t_new, norm_place_t_new
+            pick_target_label, place_target_label = pick_target_label_new, place_target_label_new
             single_task = f"Grasp {pick_target_label} and put it in {place_target_label}"
             print(f"New task: {single_task}")
+        else:
+            print("Could not determine valid new pick and/or place targets. Continuing with previous task.")
 
-
-robot.disconnect()
+if robot.is_connected:
+    robot.disconnect()
 print("Robot disconnected.")
