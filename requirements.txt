@@ -1,0 +1,15 @@
+numpy
+scipy
+pandas
+Pillow
+matplotlib
+google-generativeai
+faster-whisper
+sounddevice
+pydub
+pynput
+pytest
+transformers
+feetech-servo-sdk
+huggingface_hub
+dotenv
