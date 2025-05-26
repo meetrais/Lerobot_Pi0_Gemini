@@ -1,4 +1,4 @@
-# Lerobot_Pi0_Gemini
+# Lerobot_Pi0_Gemini - Code not working yet
 
 pip install -e "git+https://github.com/huggingface/lerobot.git@main#egg=lerobot"
 
